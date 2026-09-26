@@ -9,6 +9,10 @@ import {
 } from "../../utils/durable-atomic-file.js";
 import { nearestExistingRealpath } from "../nearest-existing-realpath.js";
 import { isRecord } from "../../utils/record.js";
+import {
+  tryPluginInstallDirectoryLock,
+  withPluginInstallDirectoryLock,
+} from "./plugin-install-directory-lock.js";
 
 const PLUGIN_INSTALL_OPS_DIR = ".plugin-install-ops";
 const PLUGIN_INSTALL_TRANSACTION_RECORD_VERSION = 1;
@@ -110,6 +114,11 @@ export interface PluginInstallRecoveryHooks {
   readonly afterLeaseClaimed?: () => Promise<void>;
   /** Test seam: runs after an empty ops listing and before rmdir. */
   readonly beforeRemoveEmptyOpsDirectory?: (opsDir: string) => Promise<void>;
+  /**
+   * Test seam: the directory matched its captured identity and the install
+   * directory lock is held, before that directory is removed.
+   */
+  readonly beforeRemoveMatchedDirectory?: (path: string) => Promise<void>;
 }
 
 export interface PluginInstallRecoveryIssue {
@@ -198,6 +207,20 @@ export async function runPluginInstallTransaction(input: {
   readonly hooks?: PluginInstallTransactionHooks;
 }): Promise<void> {
   const destination = resolve(input.destination);
+  try {
+    await withPluginInstallDirectoryLock(destination, () =>
+      runLockedPluginInstallTransaction(input, destination));
+  } finally {
+    // The directory lock lives in the ops directory, so emptiness is checked
+    // only after that lock is released.
+    await removeEmptyOpsDirectory(pluginInstallOpsDir(dirname(destination)));
+  }
+}
+
+async function runLockedPluginInstallTransaction(
+  input: Parameters<typeof runPluginInstallTransaction>[0],
+  destination: string,
+): Promise<void> {
   const parent = dirname(destination);
   const existing = await pathExists(destination);
   if (existing && !input.force) {
@@ -474,6 +497,35 @@ async function recoverParsedRecord(
 ): Promise<{ readonly recovered: boolean; readonly issue?: PluginInstallRecoveryIssue }> {
   const confined = await confineRecordPaths(installRoot, parsed);
   if (confined !== undefined) return { recovered: false, issue: confined };
+  const hold = await tryPluginInstallDirectoryLock(parsed.destination);
+  if (hold === undefined) {
+    return { recovered: false, issue: busyDirectoryIssue(parsed, recordPath) };
+  }
+  try {
+    return await recoverHeldParsedRecord(parsed, recordPath, options);
+  } finally {
+    await hold.release();
+  }
+}
+
+function busyDirectoryIssue(
+  record: PluginInstallOperationRecord,
+  recordPath: string,
+): PluginInstallRecoveryIssue {
+  return {
+    operationId: record.operationId,
+    pluginId: record.pluginId,
+    destination: record.destination,
+    message: `plugin install recovery skipped a busy install directory: ${record.destination}`,
+    preservedPaths: [recordPath, record.destination],
+  };
+}
+
+async function recoverHeldParsedRecord(
+  parsed: PluginInstallOperationRecord,
+  recordPath: string,
+  options: Parameters<typeof recoverPluginInstallTransactions>[0],
+): Promise<{ readonly recovered: boolean; readonly issue?: PluginInstallRecoveryIssue }> {
   const decision = await configRestoreDecision(parsed, options);
   if (decision === "defer") {
     return { recovered: false, issue: unrestoredConfigIssue(parsed, true) };
@@ -698,6 +750,7 @@ async function recoverDestinationReplaced(
     const removed = await removeMatchingDirectory(
       record.destination,
       record.stageIdentity,
+      hooks,
     );
     if (!removed.ok) return identityIssue(record, recordPath, removed);
     const stageRemoved = await removeMatchingDirectory(
@@ -750,7 +803,11 @@ async function finishBackupRestore(
     record.stageIdentity,
   );
   if (destinationMatchesStage.ok) {
-    const removed = await removeMatchingDirectory(record.destination, record.stageIdentity);
+    const removed = await removeMatchingDirectory(
+      record.destination,
+      record.stageIdentity,
+      hooks,
+    );
     if (!removed.ok) return identityIssue(record, recordPath, removed);
     await hooks?.afterRollbackDestinationRemoved?.();
   }
@@ -1103,10 +1160,14 @@ async function directoryMatchesIdentity(
 async function removeMatchingDirectory(
   path: string,
   expected: PluginInstallDirectoryIdentity | undefined,
+  hooks?: PluginInstallRecoveryHooks,
 ): Promise<DirectoryMatchResult> {
   if (!(await pathExists(path))) return { ok: true, path };
   const match = await directoryMatchesIdentity(path, expected);
   if (!match.ok) return match;
+  await hooks?.beforeRemoveMatchedDirectory?.(path);
+  const afterHook = await directoryMatchesIdentity(path, expected);
+  if (!afterHook.ok) return afterHook;
   await rm(path, { recursive: true, force: true });
   await syncDirectory(dirname(path));
   return { ok: true, path };
