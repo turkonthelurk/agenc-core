@@ -1204,11 +1204,14 @@ describe("plugin install transaction", () => {
     await expect(access(ops)).rejects.toThrow();
   });
 
+  // Pinning test, not a fail-first regression. The dead-holder sweep
+  // already decided this way at b9795f5d; this round only moved it into
+  // removeDeadReclaimMarker.
   it.each([
     ["dead", true],
     ["live", false],
     ["orphan", false],
-  ] as const)("sweeps a lease reclaim marker only for a dead holder of a lease that has a nonce (%s)", async (kind, swept) => {
+  ] as const)("pinning test: sweeps a lease reclaim marker only for a dead holder of a lease that has a nonce (%s)", async (kind, swept) => {
     const world = await createWorld();
     const recordPath = await writeDeadRecord(world, `00000000-0000-4000-8000-marker${kind.slice(0, 4)}00`);
     const leasePath = kind === "orphan"
