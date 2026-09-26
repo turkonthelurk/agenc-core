@@ -1204,6 +1204,23 @@ describe("plugin install transaction", () => {
     await expect(access(ops)).rejects.toThrow();
   });
 
+  it.each([
+    ["dead", true],
+    ["live", false],
+    ["orphan", false],
+  ] as const)("sweeps a lease reclaim marker only for a dead holder of a lease that has a nonce (%s)", async (kind, swept) => {
+    const world = await createWorld();
+    const recordPath = await writeDeadRecord(world, `00000000-0000-4000-8000-marker${kind.slice(0, 4)}00`);
+    const leasePath = kind === "orphan"
+      ? join(dirname(recordPath), "00000000-0000-4000-8000-000000000000.json.lease")
+      : `${recordPath}.lease`;
+    const holder = kind === "live" ? process.ppid : spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid;
+    const marker = `${leasePath}.reclaim-${randomUUID()}`;
+    await writeFile(marker, `${JSON.stringify({ pid: holder, nonce: randomUUID() })}\n`);
+    await recoverPluginInstallTransactions({ installRoots: [world.pluginStorageRoot] });
+    expect(await pathExists(marker)).toBe(!swept);
+  });
+
   it("leaves near-miss lease names in the ops directory", async () => {
     const world = await createWorld();
     const operationId = "00000000-0000-4000-8000-nearmiss0001";

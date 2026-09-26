@@ -546,11 +546,11 @@ async function recoverParsedRecord(
   }
   try {
     await hold.release();
-  } catch (cleanup) {
+  } catch (error_) {
     if (failure !== undefined) throw failure;
     return {
       recovered: result?.recovered === true,
-      issue: directoryLockCleanupIssue(parsed, recordPath, cleanup),
+      issue: directoryLockCleanupIssue(parsed, recordPath, error_),
     };
   }
   if (failure !== undefined) throw failure;
@@ -1466,56 +1466,56 @@ async function validateTrustedRecoveryRoot(
   return undefined;
 }
 
+/** Dead temp and claim files go first, then reclaim markers, as one pass each. */
 async function sweepStaleLeaseArtifacts(opsDir: string): Promise<void> {
-  let opsInfo: Awaited<ReturnType<typeof lstat>>;
+  const names = await realDirectoryNames(opsDir);
+  for (const name of names) await removeDeadLeaseArtifact(opsDir, name);
+  for (const name of names) await removeDeadReclaimMarker(opsDir, name);
+}
+
+/** Entries of a real directory; a missing, symlinked, or non-directory path has none. */
+async function realDirectoryNames(path: string): Promise<string[]> {
+  const info = await lstatIfPresent(path);
+  if (info === undefined || info.isSymbolicLink() || !info.isDirectory()) return [];
   try {
-    opsInfo = await lstat(opsDir);
+    return await readdir(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
-  if (opsInfo.isSymbolicLink() || !opsInfo.isDirectory()) return;
-  let names: string[];
+}
+
+async function removeDeadLeaseArtifact(opsDir: string, name: string): Promise<void> {
+  const pid = leaseArtifactPid(name);
+  if (pid === undefined || pidIsLive(pid)) return;
+  const path = join(opsDir, name);
+  if (await isRegularFileEntry(path)) await rm(path);
+}
+
+/** A marker goes only when its holder is dead and its lease still names a nonce. */
+async function removeDeadReclaimMarker(opsDir: string, name: string): Promise<void> {
+  const marker = RECLAIM_MARKER_NAME.exec(name);
+  const leaseName = marker?.[1];
+  const markerNonce = marker?.[2];
+  if (leaseName === undefined || markerNonce === undefined || !LEASE_ARTIFACT_UUID.test(markerNonce)) return;
+  const path = join(opsDir, name);
+  if (!await isRegularFileEntry(path)) return;
+  if (leaseHolderIsLive(parseLease(await readLeaseText(path)))) return;
+  if (leaseNonce(await readLeaseText(join(opsDir, leaseName))) === undefined) return;
+  await rm(path);
+}
+
+async function isRegularFileEntry(path: string): Promise<boolean> {
+  const info = await lstatIfPresent(path);
+  return info !== undefined && !info.isSymbolicLink() && info.isFile();
+}
+
+async function lstatIfPresent(path: string): Promise<Awaited<ReturnType<typeof lstat>> | undefined> {
   try {
-    names = await readdir(opsDir);
+    return await lstat(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
-  }
-  for (const name of names) {
-    const pid = leaseArtifactPid(name);
-    if (pid === undefined || pidIsLive(pid)) continue;
-    const path = join(opsDir, name);
-    let info: Awaited<ReturnType<typeof lstat>>;
-    try {
-      info = await lstat(path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
-    }
-    if (info.isSymbolicLink() || !info.isFile()) continue;
-    await rm(path);
-  }
-  for (const name of names) {
-    const marker = RECLAIM_MARKER_NAME.exec(name);
-    const leaseName = marker?.[1];
-    const markerNonce = marker?.[2];
-    if (leaseName === undefined || markerNonce === undefined) continue;
-    if (!LEASE_ARTIFACT_UUID.test(markerNonce)) continue;
-    const path = join(opsDir, name);
-    let info: Awaited<ReturnType<typeof lstat>>;
-    try {
-      info = await lstat(path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
-    }
-    if (info.isSymbolicLink() || !info.isFile()) continue;
-    const holder = parseLease(await readLeaseText(path));
-    if (leaseHolderIsLive(holder)) continue;
-    const currentNonce = leaseNonce(await readLeaseText(join(opsDir, leaseName)));
-    if (currentNonce === undefined) continue;
-    await rm(path);
   }
 }
 

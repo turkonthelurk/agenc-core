@@ -1,16 +1,19 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { isRecord } from "../../utils/record.js";
+import { nearestExistingRealpath } from "../nearest-existing-realpath.js";
 
 const PLUGIN_INSTALL_OPS_DIR = ".plugin-install-ops";
 const DIRECTORY_LOCK_POLL_MS = 20;
 const MAX_LOCK_BYTES = 4096;
 const RECLAIM_GUARD_SUFFIX = ".reclaim";
 const DEFAULT_RECLAIM_GUARD_STALE_MS = 60_000;
+const MAX_RECLAIM_KEY_DEPTH = 4;
+const LOWERCASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 // This lock does not provide unconditional mutual exclusion.
 //
@@ -28,22 +31,35 @@ const DEFAULT_RECLAIM_GUARD_STALE_MS = 60_000;
 // age never expires a live owner. A read error is not proof that an owner
 // is dead.
 //
+// Removal of a dead file. A dead guard (or dead key file) whose owner nonce
+// is N is removed only by the one process that link-publishes
+// `<lock>.reclaim-N`, so no two reclaimers remove the same guard. The dead
+// lock itself is removed only by the holder of `<lock>.reclaim`. Removal
+// renames the entry to a unique claim name, checks through the open file that
+// the claimed bytes and dev/ino are the ones judged dead, and only then unlinks
+// the claim. Anything else is linked back to its path.
+//
+// Lock key. The key is the entry, not what it points at: the realpath of the
+// nearest existing ancestor of the parent, plus the final name after NFC and
+// lowercase folding. A symlinked final component is not followed, so
+// replacing it with a directory keeps the same key. Names that differ only by
+// case or Unicode normalization share one lock on every platform.
+//
 // Residuals:
-// - Dead guard older than 60s. Takeover re-reads that file and unlinks the
-//   path. A guard replaced between the read and the unlink is what gets
-//   removed, and two such reclaimers can both unlink a lock.
 // - Young dead guard. try-lock reports the directory busy, so recovery skips
-//   it, and a blocking acquire polls until the guard is old enough to take.
+//   it, and a blocking acquire polls until the guard is 60s old.
+// - A claimed entry that is not the one judged dead is linked back. If another
+//   file was linked at that path in between, the claim is left in place and
+//   acquisition reports it for manual recovery.
 // - Foreign pid reuse. A dead owner's pid can belong to an unrelated live
 //   process. The lock or guard looks live until that process exits.
 // - Other pid namespace. kill(pid, 0) only sees this namespace. A holder in
 //   another namespace can look dead, and EPERM is treated as live.
 // - Same-async-context re-entry. A nested call on the same key runs the body
 //   without taking another lock.
-// - Path key. realpath of an existing destination and realpath(parent)+basename
-//   of a missing final component can name two locks for one directory.
-// - Uninstall holds this lock only around removing the install directory.
-//   Config, data, and catalog cleanup run after the lock is released.
+// - Path key. Two different entries that reach one directory (a symlink and
+//   its target, or a bind mount) are two keys. Each key still serializes the
+//   operations that replace its own entry.
 // - A non-participant can unlink a lock, or replace a tree, between a check
 //   and a removal.
 // - link fails closed on filesystems without hard links (FAT, exFAT, some
@@ -114,7 +130,19 @@ type LockStat = Awaited<ReturnType<typeof lstat>>;
 type LockRead =
   | { readonly kind: "absent" }
   | { readonly kind: "unreadable" }
-  | { readonly kind: "bytes"; readonly text: string };
+  | { readonly kind: "bytes"; readonly text: string } & EntryIdentity;
+
+interface EntryIdentity {
+  readonly dev: number | bigint;
+  readonly ino: number | bigint;
+  readonly mtimeMs: number;
+}
+
+/** A dead guard or key file as it was judged dead, read through one open fd. */
+interface DeadEntry extends EntryIdentity {
+  readonly text: string;
+  readonly nonce: string;
+}
 
 /** Fires when a blocking acquire sees a live holder and is about to wait. */
 export function setPluginInstallDirectoryLockWaitHook(hook: (() => void) | undefined): void {
@@ -155,7 +183,22 @@ export async function withPluginInstallDirectoryLock<T>(
   destination: string,
   body: () => Promise<T>,
 ): Promise<T> {
-  const key = await pluginInstallDirectoryLockKey(destination);
+  return withKeyLock(await pluginInstallDirectoryLockKey(destination), body);
+}
+
+/** Holds every destination's lock, taken in key order so two callers cannot deadlock. */
+export async function withPluginInstallDirectoryLocks<T>(
+  destinations: readonly string[],
+  body: () => Promise<T>,
+): Promise<T> {
+  const keys = await Promise.all(destinations.map((destination) => pluginInstallDirectoryLockKey(destination)));
+  // Code-unit order, so every process takes the same keys in the same order.
+  const ordered = [...new Set(keys)].toSorted((a, b) => Number(a > b) - Number(a < b));
+  const run = ordered.reduceRight<() => Promise<T>>((inner, key) => () => withKeyLock(key, inner), body);
+  return run();
+}
+
+async function withKeyLock<T>(key: string, body: () => Promise<T>): Promise<T> {
   const current = lockContext.getStore();
   if (current?.has(key) === true) return body();
   const hold = await acquire(key, true);
@@ -405,34 +448,17 @@ async function confirmUnownedUnchanged(
 }
 
 async function removeStaleLockIfUnchanged(lockPath: string, seenText: string): Promise<ReclaimOutcome> {
-  let identity: { readonly dev: LockStat["dev"]; readonly ino: LockStat["ino"] } | undefined;
+  let identity: EntryIdentity | undefined;
   for (let check = 0; check < 2; check += 1) {
-    const info = await lstatIfPresent(lockPath);
-    if (info === undefined) return "removed";
-    if (info.isSymbolicLink() || !info.isFile()) return "changed";
-    if (identity === undefined) identity = { dev: info.dev, ino: info.ino };
-    else if (info.dev !== identity.dev || info.ino !== identity.ino) return "changed";
     const read = await readLockBytes(lockPath);
-    switch (read.kind) {
-      case "absent":
-        return "removed";
-      case "unreadable":
-        return "changed";
-      case "bytes":
-        if (read.text !== seenText || holderIsLive(parseOwner(read.text), heldDirectoryLockNonces)) {
-          return "changed";
-        }
-        break;
-      default: {
-        const exhaustive: never = read;
-        throw new Error(`unhandled lock read: ${String(exhaustive)}`);
-      }
-    }
+    if (read.kind === "absent") return "removed";
+    if (read.kind === "unreadable" || read.text !== seenText) return "changed";
+    if (identity !== undefined && !sameFile(read, identity)) return "changed";
+    if (holderIsLive(parseOwner(read.text), heldDirectoryLockNonces)) return "changed";
+    identity = read;
   }
-  await unlink(lockPath).catch((error: unknown) => {
-    if (codeOf(error) !== "ENOENT") throw error;
-  });
-  return "removed";
+  if (identity === undefined) return "changed";
+  return await claimAndRemove(lockPath, { ...identity, text: seenText }) ? "removed" : "changed";
 }
 
 async function acquireReclaimGuard(lockPath: string): Promise<PluginInstallDirectoryLock | "busy"> {
@@ -445,7 +471,7 @@ async function acquireReclaimGuard(lockPath: string): Promise<PluginInstallDirec
       case "absent":
         continue;
       case "reclaimable":
-        if (!await removeStaleGuard(guardPath)) return "busy";
+        if (!await removeStaleGuard(lockPath, guardPath)) return "busy";
         continue;
       case "busy":
         return "busy";
@@ -471,7 +497,7 @@ async function inspectGuard(guardPath: string): Promise<GuardInspection> {
     case "unreadable":
       return "corrupt";
     case "bytes":
-      return guardRecordState(read.text, epochMs(info.mtimeMs));
+      return guardRecordState(read.text, read.mtimeMs);
     default: {
       const exhaustive: never = read;
       throw new Error(`unhandled lock read: ${String(exhaustive)}`);
@@ -479,39 +505,96 @@ async function inspectGuard(guardPath: string): Promise<GuardInspection> {
   }
 }
 
-async function removeStaleGuard(guardPath: string): Promise<boolean> {
-  const first = await readReclaimableGuard(guardPath);
-  if (first === undefined) return false;
-  const again = await readReclaimableGuard(guardPath);
-  if (
-    again === undefined
-    || again.text !== first.text
-    || again.dev !== first.dev
-    || again.ino !== first.ino
-  ) return false;
-  try {
-    await unlink(guardPath);
-  } catch (error) {
-    if (codeOf(error) !== "ENOENT") throw error;
-  }
-  return true;
+async function removeStaleGuard(lockPath: string, guardPath: string): Promise<boolean> {
+  const seen = await readDeadEntry(guardPath);
+  return seen !== undefined && removeDeadEntry(lockPath, guardPath, seen, 0);
 }
 
-async function readReclaimableGuard(
-  guardPath: string,
-): Promise<{ readonly text: string; readonly dev: LockStat["dev"]; readonly ino: LockStat["ino"] } | undefined> {
-  const info = await lstatIfPresent(guardPath);
-  if (info === undefined || info.isSymbolicLink() || !info.isFile()) return undefined;
-  const read = await readLockBytes(guardPath);
-  if (read.kind !== "bytes") return undefined;
-  if (guardRecordState(read.text, epochMs(info.mtimeMs)) !== "reclaimable") return undefined;
-  return { text: read.text, dev: info.dev, ino: info.ino };
+/**
+ * Removes `path` only while holding `<lock>.reclaim-<nonce of the dead entry>`.
+ * A dead holder of that key file is removed the same way, one level deeper.
+ */
+async function removeDeadEntry(lockPath: string, path: string, seen: DeadEntry, depth: number): Promise<boolean> {
+  const keyPath = `${lockPath}${RECLAIM_GUARD_SUFFIX}-${seen.nonce}`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const key = await holdLinkedFile(keyPath, heldGuardNonces);
+    if (key !== undefined) return removeUnderKey(key, path, seen);
+    const blocker = await inspectGuard(keyPath);
+    if (blocker === "corrupt") throw new PluginInstallDirectoryLockCorruptError(keyPath);
+    if (blocker === "busy") return false;
+    if (blocker === "reclaimable" && !await removeDeadKey(lockPath, keyPath, depth)) return false;
+  }
+  return false;
+}
+
+async function removeDeadKey(lockPath: string, keyPath: string, depth: number): Promise<boolean> {
+  if (depth >= MAX_RECLAIM_KEY_DEPTH) return false;
+  const seen = await readDeadEntry(keyPath);
+  return seen !== undefined && removeDeadEntry(lockPath, keyPath, seen, depth + 1);
+}
+
+async function removeUnderKey(key: PluginInstallDirectoryLock, path: string, seen: DeadEntry): Promise<boolean> {
+  let removed = false;
+  try {
+    const read = await readLockBytes(path);
+    if (read.kind === "absent") removed = true;
+    else if (read.kind === "bytes" && read.text === seen.text && sameFile(read, seen)) {
+      removed = await claimAndRemove(path, seen);
+    }
+  } finally {
+    await key.release();
+  }
+  return removed;
+}
+
+/**
+ * Renames `path` to a name only this call knows, then compares the claimed
+ * file's bytes and dev/ino, read through one fd, with `expected`. A match is
+ * unlinked. Anything else is linked back and reported as not removed.
+ */
+async function claimAndRemove(
+  path: string,
+  expected: { readonly text: string } & Pick<EntryIdentity, "dev" | "ino">,
+): Promise<boolean> {
+  const claim = `${path}.claim-${randomUUID()}`;
+  try {
+    await rename(path, claim);
+  } catch (error) {
+    if (codeOf(error) === "ENOENT") return true;
+    throw error;
+  }
+  const got = await readLockBytes(claim);
+  if (got.kind === "bytes" && got.text === expected.text && sameFile(got, expected)) {
+    await unlink(claim).catch(ignoreMissing);
+    return true;
+  }
+  try {
+    await link(claim, path);
+  } catch (error) {
+    if (codeOf(error) === "EEXIST") throw new PluginInstallDirectoryLockCorruptError(claim);
+    throw error;
+  }
+  await unlink(claim).catch(ignoreMissing);
+  return false;
+}
+
+async function readDeadEntry(path: string): Promise<DeadEntry | undefined> {
+  const read = await readLockBytes(path);
+  if (read.kind !== "bytes" || guardRecordState(read.text, read.mtimeMs) !== "reclaimable") return undefined;
+  const nonce = parseOwner(read.text)?.nonce;
+  return nonce === undefined ? undefined : { ...read, nonce };
+}
+
+function sameFile(left: Pick<EntryIdentity, "dev" | "ino">, right: Pick<EntryIdentity, "dev" | "ino">): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 function guardRecordState(text: string, mtimeMs: number): GuardInspection {
   const parsed = parseOwner(text);
   if (parsed === undefined) return "corrupt";
   if (holderIsLive(parsed, heldGuardNonces)) return "busy";
+  // A dead guard's nonce names the key file that guards its removal.
+  if (parsed.nonce === undefined || !LOWERCASE_UUID.test(parsed.nonce)) return "corrupt";
   const recordedAt = parsed.acquiredAtMs ?? mtimeMs;
   return Date.now() - recordedAt >= reclaimGuardStaleMs ? "reclaimable" : "busy";
 }
@@ -544,7 +627,13 @@ async function readLockBytes(path: string): Promise<LockRead> {
     if (!info.isFile() || info.size > MAX_LOCK_BYTES) return { kind: "unreadable" };
     const buffer = Buffer.alloc(info.size);
     await handle.read(buffer, 0, info.size, 0);
-    return { kind: "bytes", text: buffer.toString("utf8") };
+    return {
+      kind: "bytes",
+      text: buffer.toString("utf8"),
+      dev: info.dev,
+      ino: info.ino,
+      mtimeMs: epochMs(info.mtimeMs),
+    };
   } catch (error) {
     const code = codeOf(error);
     if (code === "ENOENT") return { kind: "absent" };
@@ -622,18 +711,8 @@ async function lstatIfPresent(path: string): Promise<LockStat | undefined> {
 
 async function pluginInstallDirectoryLockKey(destination: string): Promise<string> {
   const resolved = resolve(destination);
-  try {
-    return await realpath(resolved);
-  } catch (error) {
-    if (codeOf(error) !== "ENOENT") throw error;
-    let parent = dirname(resolved);
-    try {
-      parent = await realpath(parent);
-    } catch (parentError) {
-      if (codeOf(parentError) !== "ENOENT") throw parentError;
-    }
-    return join(parent, basename(resolved));
-  }
+  const parent = await nearestExistingRealpath(dirname(resolved)) ?? dirname(resolved);
+  return join(parent, basename(resolved).normalize("NFC").toLowerCase());
 }
 
 function lockFilePath(key: string): string {

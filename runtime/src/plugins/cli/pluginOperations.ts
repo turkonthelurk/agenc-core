@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { cp, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
-import { withPluginInstallDirectoryLock } from "./plugin-install-directory-lock.js";
+import { withPluginInstallDirectoryLocks } from "./plugin-install-directory-lock.js";
 import {
   canonicalPluginInstallRoot,
   runPluginInstallTransaction,
@@ -739,11 +739,19 @@ export async function uninstallPluginOp(
   if (targetRoots.length === 0) {
     throw new Error(`plugin is not installed in ${scope} scope: ${input.pluginId}`);
   }
-  for (const root of targetRoots) {
-    // Only this directory removal is locked. Config, plugin data, and catalog
-    // cleanup below run after the lock is released.
-    await withPluginInstallDirectoryLock(root, () => rm(root, { recursive: true, force: true }));
-  }
+  // An install in this scope targets one of these roots or the default
+  // directory, so its commit cannot land between the removal and the cleanup.
+  const defaultRoot = join(await realpath(pluginScopeRoot(scope, input)), sanitizeInstallName(pluginId));
+  return withPluginInstallDirectoryLocks([...targetRoots, defaultRoot], () =>
+    removeInstalledPlugin(pluginId, targetRoots, input));
+}
+
+async function removeInstalledPlugin(
+  pluginId: string,
+  targetRoots: readonly string[],
+  input: UninstallPluginInput,
+): Promise<UninstallPluginResult> {
+  for (const root of targetRoots) await rm(root, { recursive: true, force: true });
   const remainsInstalled = await pluginIdRemainsInstalled(pluginId, input);
   const removedConfig = remainsInstalled
     ? false

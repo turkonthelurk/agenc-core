@@ -16,12 +16,25 @@ const unlinkInterleave = vi.hoisted(() => ({
   maxInside: 0,
 }));
 
+// Pauses the next unlink or rename of a path, one queued step per call.
+const mutationGate = vi.hoisted(() => ({
+  steps: new Map<string, (() => Promise<void>)[]>(),
+  async pass(path: string): Promise<void> {
+    await this.steps.get(path)?.shift()?.();
+  },
+}));
+
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    rename: async (from: Parameters<typeof actual.rename>[0], to: Parameters<typeof actual.rename>[1]) => {
+      await mutationGate.pass(String(from));
+      return actual.rename(from, to);
+    },
     unlink: async (path: Parameters<typeof actual.unlink>[0]) => {
       const target = String(path);
+      await mutationGate.pass(target);
       if (
         unlinkInterleave.failPath !== undefined
         && target === unlinkInterleave.failPath
@@ -115,6 +128,43 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => {
     setTimeout(resolveDelay, ms);
   });
+}
+
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve: () => void = () => {};
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+/** A queued mutation step: `arrived` settles when the call starts, and it continues after `proceed`. */
+function pausedStep(): {
+  readonly arrived: ReturnType<typeof deferred>;
+  readonly proceed: ReturnType<typeof deferred>;
+  readonly run: () => Promise<void>;
+} {
+  const arrived = deferred();
+  const proceed = deferred();
+  return {
+    arrived,
+    proceed,
+    run: async () => {
+      arrived.resolve();
+      await proceed.promise;
+    },
+  };
+}
+
+function within(promise: Promise<void>, ms: number): Promise<"settled" | "timeout"> {
+  return Promise.race([promise.then(() => "settled" as const), delay(ms).then(() => "timeout" as const)]);
+}
+
+async function plantDeadGuard(lockPath: string): Promise<{ readonly guardPath: string; readonly text: string }> {
+  const guardPath = `${lockPath}.reclaim`;
+  const text = `${JSON.stringify({ pid: exitedPid(), nonce: randomUUID(), acquiredAtMs: Date.now() - 10_000 })}\n`;
+  await writeFile(guardPath, text);
+  return { guardPath, text };
 }
 
 describe("plugin install directory lock reclaim", () => {
@@ -704,6 +754,142 @@ describe("plugin install directory lock reclaim", () => {
     }
   });
 });
+
+describe("plugin install directory lock gaps", () => {
+  it("admits one holder when two reclaimers race for the same dead reclaim guard", async () => {
+    const world = await plantStaleLock();
+    const { guardPath } = await plantDeadGuard(world.lockPath);
+    const guardA = pausedStep();
+    const guardB = pausedStep();
+    const lockA = pausedStep();
+    const lockB = pausedStep();
+    const steps = [guardA, guardB, lockA, lockB];
+    const aIn = deferred();
+    const bIn = deferred();
+    const holdA = deferred();
+    const bWaiting = deferred();
+    let inside = 0;
+    let maxInside = 0;
+    const occupy = async (entered: () => void, hold?: Promise<void>): Promise<void> => {
+      inside += 1;
+      maxInside = Math.max(maxInside, inside);
+      entered();
+      await hold;
+      inside -= 1;
+    };
+    try {
+      setPluginInstallDirectoryLockGuardStaleMs(1);
+      setPluginInstallDirectoryLockWaitHook(() => bWaiting.resolve());
+      mutationGate.steps.set(guardPath, [guardA.run, guardB.run]);
+      mutationGate.steps.set(world.lockPath, [lockA.run, lockB.run]);
+      const a = withPluginInstallDirectoryLock(world.destination, () => occupy(aIn.resolve, holdA.promise));
+      expect(await within(guardA.arrived.promise, 2_000)).toBe("settled");
+      const b = withPluginInstallDirectoryLock(world.destination, () => occupy(bIn.resolve));
+      const bAtGuard = await Promise.race([
+        guardB.arrived.promise.then(() => true),
+        bWaiting.promise.then(() => false),
+      ]);
+      guardA.proceed.resolve();
+      if (bAtGuard) {
+        await within(lockA.arrived.promise, 2_000);
+        guardB.proceed.resolve();
+        await Promise.race([lockB.arrived.promise, bWaiting.promise, delay(2_000)]);
+        lockA.proceed.resolve();
+      } else {
+        for (const step of steps) step.proceed.resolve();
+      }
+      expect(await within(aIn.promise, 2_000)).toBe("settled");
+      for (const step of steps) step.proceed.resolve();
+      await within(bIn.promise, 300);
+      expect(maxInside).toBe(1);
+      holdA.resolve();
+      await Promise.all([a, b]);
+      expect(maxInside).toBe(1);
+      expect(inside).toBe(0);
+    } finally {
+      for (const step of steps) step.proceed.resolve();
+      holdA.resolve();
+      mutationGate.steps.clear();
+      setPluginInstallDirectoryLockWaitHook(undefined);
+      setPluginInstallDirectoryLockGuardStaleMs(undefined);
+      await rm(world.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not remove a live reclaim guard that replaced the dead one after inspection", async () => {
+    const world = await plantStaleLock();
+    const { guardPath } = await plantDeadGuard(world.lockPath);
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const liveText = `${JSON.stringify({ pid: child.pid, nonce: randomUUID(), acquiredAtMs: Date.now() })}\n`;
+    try {
+      setPluginInstallDirectoryLockGuardStaleMs(1);
+      mutationGate.steps.set(guardPath, [async () => {
+        await rm(guardPath);
+        await writeFile(guardPath, liveText);
+      }]);
+      const hold = await tryPluginInstallDirectoryLock(world.destination);
+      await hold?.release();
+      expect(await readFile(guardPath, "utf8").catch((error: unknown) => String(error))).toBe(liveText);
+      expect(hold).toBeUndefined();
+      expect(await readFile(world.lockPath, "utf8")).toBe(world.text);
+      expect((await readdir(dirname(world.lockPath))).filter((name) => name.includes(".claim-"))).toEqual([]);
+    } finally {
+      child.kill();
+      mutationGate.steps.clear();
+      setPluginInstallDirectoryLockGuardStaleMs(undefined);
+      await rm(world.root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps one lock when a symlinked destination is replaced by a directory while held", async () => {
+    const alias = (root: string): string => join(root, "alias");
+    expect(await secondLockWhileFirstHeld(alias, alias, async (world) => {
+      await symlink(world.destination, alias(world.root));
+    }, async (world) => {
+      await rm(alias(world.root));
+      await mkdir(alias(world.root));
+    })).toEqual({ first: true, second: false });
+  });
+
+  it("keeps one lock for a missing destination named through a symlinked ancestor", async () => {
+    expect(await secondLockWhileFirstHeld(
+      (root) => join(root, "linked", "fresh", "demo"),
+      (root) => join(root, "demo", "fresh", "demo"),
+      async (world) => {
+        await symlink(world.destination, join(world.root, "linked"));
+      },
+    )).toEqual({ first: true, second: false });
+  });
+
+  it.each([
+    ["case", "Demo-Case", "demo-case"],
+    ["unicode normalization", "caf\u00e9", "cafe\u0301"],
+  ])("keeps one lock for destination names that differ only by %s", async (_label, left, right) => {
+    expect(await secondLockWhileFirstHeld((root) => join(root, left), (root) => join(root, right)))
+      .toEqual({ first: true, second: false });
+  });
+});
+
+/** Try-locks `first`, runs `between`, then try-locks `second` while the first is still held. */
+async function secondLockWhileFirstHeld(
+  first: (root: string) => string,
+  second: (root: string) => string,
+  before?: (world: Awaited<ReturnType<typeof plantDestination>>) => Promise<void>,
+  between?: (world: Awaited<ReturnType<typeof plantDestination>>) => Promise<void>,
+): Promise<{ readonly first: boolean; readonly second: boolean }> {
+  const world = await plantDestination();
+  try {
+    await before?.(world);
+    const firstHold = await tryPluginInstallDirectoryLock(first(world.root));
+    await between?.(world);
+    const secondHold = await tryPluginInstallDirectoryLock(second(world.root));
+    await secondHold?.release();
+    await firstHold?.release();
+    return { first: firstHold !== undefined, second: secondHold !== undefined };
+  } finally {
+    await rm(world.root, { recursive: true, force: true });
+  }
+}
 
 function makeFifo(path: string): void {
   const result = spawnSync("mkfifo", [path], { stdio: "pipe" });
