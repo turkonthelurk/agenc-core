@@ -33,7 +33,7 @@ describe.runIf(process.platform === "linux")("persistent unified exec lifecycle"
     const sandboxClose = vi.spyOn(SessionSandbox.prototype, "close");
     const launch = vi.spyOn(supervised, "spawnContainedProcess");
     for (let i = 0; i < 2; i++) {
-      const result = await withOneShotFastMode(() => run("printf bypass", { runtimeSandbox: undefined }));
+      const result = await withOneShotFastMode("bypass", () => run("printf bypass", { runtimeSandbox: undefined, ownerId: "bypass" }));
       expect(result.stdout).toBe("bypass");
       expect(result.exitCode).toBe(0);
     }
@@ -44,9 +44,9 @@ describe.runIf(process.platform === "linux")("persistent unified exec lifecycle"
   });
   it("drains a previous sandbox once when switching to bypass", async () => {
     const sandboxClose = vi.spyOn(SessionSandbox.prototype, "close");
-    await run("true");
+    await run("true", { ownerId: "bypass" });
     for (let i = 0; i < 2; i++) {
-      const result = await withOneShotFastMode(() => run("printf bypass", { runtimeSandbox: undefined }));
+      const result = await withOneShotFastMode("bypass", () => run("printf bypass", { runtimeSandbox: undefined, ownerId: "bypass" }));
       expect(result.stdout).toBe("bypass");
       expect(result.exitCode).toBe(0);
     }
@@ -148,6 +148,23 @@ describe.runIf(process.platform === "linux")("persistent unified exec lifecycle"
     await first.prepareForDurableClose();
     await expect(run("true", one)).rejects.toThrow(/owner/);
     expect((await run(namespace, two)).stdout).toBe(b.stdout);
+  });
+  it("does not lend the parent command server to a nested session", async () => {
+    const launch = vi.spyOn(supervised, "spawnContainedProcess");
+    await withOneShotFastMode("parent", async () => {
+      const parent = await run("printf parent", { runtimeSandbox: undefined, ownerId: "parent" });
+      expect(parent.stdout).toBe("parent");
+      expect(parent.exitCode).toBe(0);
+      const child = await run("printf child", { runtimeSandbox: undefined, ownerId: "child" });
+      expect(child.stdout).toBe("child");
+      expect(child.exitCode).toBe(0);
+    });
+    const childLaunch = launch.mock.calls.find((call) =>
+      JSON.stringify(call[1]).includes("printf child"));
+    expect(childLaunch?.[2].linuxContainment).not.toBe("subreaper");
+    const parentLaunch = launch.mock.calls.find((call) =>
+      call[2].linuxContainment === "subreaper");
+    expect(parentLaunch).toBeDefined();
   });
   it("closes cached namespaces across authority quiesce and durable shutdown", async () => {
     const launch = vi.spyOn(supervised, "spawnContainedProcess");

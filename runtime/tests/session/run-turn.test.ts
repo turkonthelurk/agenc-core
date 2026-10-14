@@ -73,6 +73,7 @@ import { resumeTurnFromCheckpoint } from "../conversation/thread-manager.js";
 import { ExecutionAdmissionKernel } from "../budget/execution-admission-kernel.js";
 import { bindExecutionAdmissionJournal } from "./execution-admission-journal.js";
 import { shutdownSessionLifecycle } from "./lifecycle.js";
+import { withOneShotFastMode } from "../../src/one-shot-fast-mode.js";
 
 function enqueue(command: QueuedCommand): void {
   enqueueCommand({
@@ -8160,5 +8161,61 @@ describe("provider outage wait (#2212)", () => {
     } finally {
       restore();
     }
+  });
+});
+
+describe("fast mode session binding", () => {
+  function stubRollout(session: ReturnType<typeof mkSession>["session"]): void {
+    session.rolloutStore = {
+      assertCompactionProjectionReady: () => {},
+      append: vi.fn(),
+      appendRollout: vi.fn(),
+      rolloutPath: "/tmp/does-not-matter.jsonl",
+    } as unknown as ReturnType<typeof mkSession>["session"]["rolloutStore"];
+  }
+
+  test("a nested session still checkpoints inside a parent fast scope and the parent does not", async () => {
+    const provider = mkProvider({ content: "finished", toolCalls: [] });
+    const registry = { tools: [], toLLMTools: () => [], dispatch: vi.fn() } as unknown as ToolRegistry;
+    const child = mkSession({
+      conversationId: "child-session",
+      provider,
+      registry,
+    });
+    const parent = mkSession({
+      conversationId: "parent-session",
+      provider,
+      registry,
+    });
+    stubRollout(child.session);
+    stubRollout(parent.session);
+    const resume = {
+      history: [{ role: "user" as const, content: "Continue" }],
+      displayUserMessage: null,
+      resume: {
+        turnId: "continued",
+        fromIteration: 1,
+        fromCheckpointSeq: 1,
+        persistedMessageCount: 1,
+        restoreSlice: {
+          turnCount: 2,
+          recoveryReentryCount: 0,
+          maxOutputTokensRecoveryCount: 0,
+          continuationNudgeCount: 0,
+          stopHookBlockingCount: 0,
+          modelSampleOrdinal: 0,
+        },
+      },
+    };
+    await withOneShotFastMode("parent-session", () => drain(child.session.runTurn("", {
+      ...resume,
+      subId: "child-turn",
+    })));
+    expect(child.events.some((event) => event.msg.type === "turn_checkpoint")).toBe(true);
+    await withOneShotFastMode("parent-session", () => drain(parent.session.runTurn("", {
+      ...resume,
+      subId: "parent-turn",
+    })));
+    expect(parent.events.some((event) => event.msg.type === "turn_checkpoint")).toBe(false);
   });
 });

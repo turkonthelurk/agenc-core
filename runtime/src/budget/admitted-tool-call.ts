@@ -1,4 +1,4 @@
-import { oneShotFastModeActive, requiresAtomicSpendAdmission } from "../one-shot-fast-mode.js";
+import { oneShotFastModeAppliesTo, requiresAtomicSpendAdmission } from "../one-shot-fast-mode.js";
 /** Shared M3 boundary for approved tool effects. */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -822,7 +822,7 @@ export function flushOneShotEffectJournal(session: Session): void {
 export async function runAdmittedToolCall(
   params: AdmittedToolCallOptions,
 ): Promise<ToolDispatchResult> {
-  if (oneShotFastModeActive() && !requiresAtomicSpendAdmission(params.session)) {
+  if (oneShotFastModeAppliesTo(String(params.session.conversationId ?? "")) && !requiresAtomicSpendAdmission(params.session)) {
     const category = recoveryCategory(params.tool);
     assertNoLiveUnknownEffect(params.session, category);
     const startedAt = new Date().toISOString();

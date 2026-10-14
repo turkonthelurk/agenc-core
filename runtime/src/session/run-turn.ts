@@ -1,7 +1,7 @@
 import { assistantMessageFromResponse, parseToolUseBlocks, admittedModelStepId } from "../phases/stream-model.js";
 import { cumulativeUsage } from "./cumulative-usage.js";
 import { runMinimalTurn } from "./minimal-turn.js";
-import { oneShotFastModeActive, bypassFastModeEnabled, withOneShotFastMode } from "../one-shot-fast-mode.js";
+import { oneShotFastModeAppliesTo, bypassFastModeEnabled, withOneShotFastMode } from "../one-shot-fast-mode.js";
 import { resolveMainLoopReasoningEffort } from "./session-reasoning-effort.js";
 import { admitReasoningCapSample, clearReasoningCapPolicyForTransition } from "./reasoning-cap-policy.js";
 /**
@@ -2287,8 +2287,9 @@ async function* runTurnKernelInner(
       ...(opts.signal ? [opts.signal] : [])]);
     // Pay empty broker startup once before model latency begins. No shell is
     // launched here; each command still crosses the manager's live admission.
-    await withOneShotFastMode(() => session.services.unifiedExecManager?.prepareOneShotCommandBoundary?.(
-      String(session.conversationId), session.unifiedExecOwnerBinding, signal,
+    const fastSessionId = String(session.conversationId);
+    await withOneShotFastMode(fastSessionId, () => session.services.unifiedExecManager?.prepareOneShotCommandBoundary?.(
+      fastSessionId, session.unifiedExecOwnerBinding, signal,
     ));
     let content = "";
     const fastMessages = state.messages;
@@ -2319,7 +2320,7 @@ async function* runTurnKernelInner(
     });
     try {
       for (;;) {
-        const next = await withOneShotFastMode(() => loop.next());
+        const next = await withOneShotFastMode(String(session.conversationId), () => loop.next());
         if (next.done) {
           if (next.value.reason === "continue_normal") {
             continuedFromFastMode = true;
@@ -2358,7 +2359,7 @@ async function* runTurnKernelInner(
         if (next.value.type === "turn_complete") content = next.value.content;
         yield next.value;
       }
-    } finally { await withOneShotFastMode(() => loop.return({ reason: "cancelled" })); }
+    } finally { await withOneShotFastMode(String(session.conversationId), () => loop.return({ reason: "cancelled" })); }
   }
   const turnQuerySource = sessionQuerySourceForTurn(session, opts.querySource);
   let persistedMessageCount =
@@ -2599,7 +2600,7 @@ async function* runTurnKernelInner(
     boundary: "iteration" | "postAssistant",
     options: { readonly force?: boolean } = {},
   ): void => {
-    if (oneShotFastModeActive() || !durableTurnsCfg.checkpointEnabled) return;
+    if (oneShotFastModeAppliesTo(String(session.conversationId)) || !durableTurnsCfg.checkpointEnabled) return;
     if (rolloutPersistenceSuspended()) return;
     if (!session.rolloutStore) return;
     if (options.force !== true && durableTurnsCfg.checkpointMinIntervalMs > 0) {
