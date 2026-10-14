@@ -95,7 +95,7 @@ import { computeCheckpointPrefixHashV3 } from "../../src/session/durable-checkpo
 import { currentBuildId } from "../../src/session/durable-turns.js";
 import { parseRolloutLine, serializeRolloutItem, type RolloutItem } from "../../src/session/rollout-item.js";
 import { RolloutStore } from "../../src/session/rollout-store.js";
-import { openStateDatabases } from "../../src/state/sqlite-driver.js";
+import { openStateDatabases, resolveStateDatabasePaths } from "../../src/state/sqlite-driver.js";
 import { StateRunDurabilityRepository } from "../../src/state/run-durability.js";
 import { createOperatorEffectReviewResolution } from "../../src/state/effect-review.js";
 import { listUnresolvedUnknownOutcomeEffects } from "../../src/state/unknown-outcome-gate.js";
@@ -2848,6 +2848,140 @@ describe("AgenC delegate background-agent runner", () => {
       clearCurrentRuntimeSession();
       await target.runner.stopAgent(parentId);
       driver.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a live worktree child's effect resolved after its journal is replayed", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "agenc-live-review-replay-"));
+    const cwd = join(root, "workspace");
+    const childCwd = join(root, "worktree");
+    const home = join(root, "owner");
+    mkdirSync(cwd);
+    mkdirSync(childCwd);
+    mkdirSync(home);
+    const parentId = "parent-agent";
+    const childId = "worktree-child";
+    const recordedAt = "2026-09-18T00:00:00.000Z";
+    const intentId = "intent-side-effecting";
+    const intentEvent: Event = {
+      eventId: `legacy-event:1:${intentId}`,
+      id: intentId,
+      seq: 1,
+      msg: {
+        type: "effect_intent",
+        payload: {
+          runId: childId,
+          stepId: "tool:turn-1:call-1",
+          callId: "call-1",
+          toolName: "test-effect",
+          recoveryCategory: "side-effecting",
+          intentDigest: "intent-digest",
+          attempt: 1,
+          recordedAt,
+        },
+      },
+    };
+    const openChild = (resume: boolean) => {
+      const rollout = new RolloutStore({
+        cwd: childCwd,
+        sessionId: childId,
+        agencHome: home,
+        agencVersion: "0.6.2",
+        sessionTempRoot: canonicalTmpdir(),
+        autoStartScheduler: false,
+        ...(resume ? { resume: true } : {}),
+      });
+      rollout.open({
+        sessionId: childId,
+        timestamp: recordedAt,
+        cwd: childCwd,
+        originator: "parent-resolve-replay",
+        agencVersion: "0.6.2",
+      });
+      return rollout;
+    };
+    const seeded = openChild(false);
+    expect(seeded.append(intentEvent, { durable: true })).toBe(true);
+    seeded.close();
+    const live = openChild(true);
+    const childSession = {
+      conversationId: childId,
+      abortController: new AbortController(),
+      isShuttingDown: false,
+      onBeforeDurableClose: () => () => {},
+      sessionConfiguration: { cwd: childCwd },
+      rolloutStore: live,
+      emit: (event: Event) => {
+        const seq = live.readAll().reduce((max, item) => {
+          if (item.type !== "event_msg" || item.payload.seq === undefined) return max;
+          return Math.max(max, item.payload.seq);
+        }, 0) + 1;
+        const stamped: Event = { ...event, seq };
+        if (!live.append(stamped, { durable: true })) {
+          throw new Error("child journal refused the review");
+        }
+        return stamped;
+      },
+    } as unknown as Session;
+    const childLive = {
+      agentId: childId,
+      agentPath: "/root/worktree_child",
+      abortController: new AbortController(),
+    } as unknown as LiveAgent;
+    bindLiveAgentSession(childLive, childSession);
+    const target = makeTopLevelRunner({ conversationId: parentId, workspaceRoot: cwd });
+    Object.assign(target.configStore, { homeContext: { path: home } });
+    Object.assign(target.control, {
+      getLive: (id: string) => id === childId ? childLive : undefined,
+      listLive: () => [childLive],
+    });
+    Object.assign(target.rolloutStore, {
+      listThreadSpawnDescendants: () => [{ childThreadId: childId }],
+      readAll: () => [],
+    });
+    const resolution = createOperatorEffectReviewResolution({
+      disposition: "confirmed_no_effect", actorId: "operator", evidenceRef: "test:replay-child",
+      evidenceSha256: "e".repeat(64), reviewedAt: recordedAt,
+    });
+    const statePaths = resolveStateDatabasePaths({ cwd: childCwd, agencHome: home });
+    clearCurrentRuntimeSession();
+    let replayed: RolloutStore | undefined;
+    let liveClosed = false;
+    try {
+      const before = openStateDatabases({ cwd: childCwd, agencHome: home });
+      expect(listUnresolvedUnknownOutcomeEffects(before, childId)).toHaveLength(1);
+      before.close();
+      await target.runner.startAgent({ objective: "idle replay parent", deferInitialTurn: true });
+      await expect(target.runner.resolveLiveEffectReview(parentId, {
+        sessionId: parentId, toolCallId: "call-1", resolution,
+      })).resolves.toMatchObject({ kind: "resolved", durable: true, runId: childId });
+      live.close();
+      liveClosed = true;
+      rmSync(statePaths.stateDbPath, { force: true });
+      rmSync(`${statePaths.stateDbPath}-wal`, { force: true });
+      rmSync(`${statePaths.stateDbPath}-shm`, { force: true });
+      replayed = openChild(true);
+      const after = openStateDatabases({ cwd: childCwd, agencHome: home });
+      try {
+        expect(new StateRunDurabilityRepository(after).getEffect(childId, "tool:turn-1:call-1")).toMatchObject({
+          reviewStatus: "resolved",
+          outcome: "unknown_outcome",
+          reviewedBy: "operator",
+        });
+        expect(listUnresolvedUnknownOutcomeEffects(after, childId)).toEqual([]);
+        expect(replayed.hasPendingEffectReviews()).toBe(false);
+        expect(replayed.readAll().filter((item) =>
+          item.type === "event_msg" && item.payload.msg.type === "effect_review_resolved",
+        )).toHaveLength(1);
+      } finally {
+        after.close();
+      }
+    } finally {
+      clearCurrentRuntimeSession();
+      await target.runner.stopAgent(parentId);
+      if (!liveClosed) live.close();
+      replayed?.close();
       rmSync(root, { recursive: true, force: true });
     }
   });
