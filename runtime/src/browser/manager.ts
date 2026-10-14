@@ -779,7 +779,17 @@ export class BrowserManager {
         ? { lookup: this.#options.lookup }
         : {}),
     });
-    const proxyPort = await proxy.start();
+    let proxyPort: number;
+    try {
+      proxyPort = await proxy.start();
+    } catch (err) {
+      const error = toError(err);
+      await proxy.stop().catch(() => {});
+      throw markEffectBoundaryNotCrossed(error, {
+        evidenceRef: "tool:Browser:proxy-listen-failed",
+        evidenceMaterial: error.message,
+      });
+    }
 
     // Everything after the proxy is listening must stop it on failure, or the
     // loopback listener leaks (and every retried action leaks another). This
