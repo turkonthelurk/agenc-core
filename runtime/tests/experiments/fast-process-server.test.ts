@@ -50,12 +50,12 @@ describe.runIf(process.platform === "linux")("bypass reusable command boundary",
     const owner = manager.createOwnerLifetime("prepared"), binding = owner.bind();
     await manager.prepareOneShotCommandBoundary("prepared", binding);
     expect(launch).not.toHaveBeenCalled();
-    await withOneShotFastMode(() => manager.prepareOneShotCommandBoundary("prepared", binding));
+    await withOneShotFastMode("prepared", () => manager.prepareOneShotCommandBoundary("prepared", binding));
     expect(launch).toHaveBeenCalledTimes(1);
     const pid = launch.mock.results[0]!.value.pid;
     await owner.prepareForDurableClose();
     expect(() => process.kill(pid, 0)).toThrow();
-    await expect(withOneShotFastMode(() => manager.prepareOneShotCommandBoundary("prepared", binding))).rejects.toThrow();
+    await expect(withOneShotFastMode("prepared", () => manager.prepareOneShotCommandBoundary("prepared", binding))).rejects.toThrow();
     expect(launch).toHaveBeenCalledTimes(1);
   });
   test("an aborted preparation never publishes a command", async () => {
@@ -187,7 +187,7 @@ describe.runIf(process.platform === "linux")("bypass reusable command boundary",
       entered(); await new Promise<void>(resolve => { decline=resolve; }); return undefined;
     });
     const launch = vi.spyOn(supervised, "spawnContainedProcess");
-    await withOneShotFastMode(async () => {
+    await withOneShotFastMode("closing", async () => {
       const owner = manager.createOwnerLifetime("closing");
       const pending = manager.execCommand({cmd:"echo must-not-run",login:false,ownerId:"closing",ownerBinding:owner.bind()});
       const rejected = expect(pending).rejects.toThrow();
@@ -205,7 +205,7 @@ describe.runIf(process.platform === "linux")("bypass reusable command boundary",
   test("manager drains reusable brokers on owner close and resumes with a fresh lifetime", async () => {
     const manager = new UnifiedExecProcessManager(); managers.push(manager);
     const spy = vi.spyOn(supervised, "spawnContainedProcess");
-    await withOneShotFastMode(async () => {
+    await withOneShotFastMode("fast", async () => {
       const owner = manager.createOwnerLifetime("fast");
       const opts = {ownerId:"fast",ownerBinding:owner.bind(),login:false};
       expect((await manager.execCommand({cmd:"echo first",...opts})).stdout).toBe("first\n");

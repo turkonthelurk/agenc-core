@@ -20,7 +20,7 @@ test("journals actual tool intervals only at final flush without executing a sec
   vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-08T20:00:00Z"));
   const { session, events } = fixture();
   const invoke = vi.fn(async (context) => { context.crossEffectBoundary(); vi.advanceTimersByTime(37); return { content: "done" }; });
-  const result = await withOneShotFastMode(() => runAdmittedToolCall({ session, turnId: "turn", callId: "call",
+  const result = await withOneShotFastMode("one-shot", () => runAdmittedToolCall({ session, turnId: "turn", callId: "call",
     tool: { name: "read", description: "", inputSchema: { type: "object" }, recoveryCategory: "read-only", execute: vi.fn() },
     args: {}, invoke }));
   expect(result.content).toBe("done"); expect(events).toHaveLength(0);
@@ -35,10 +35,10 @@ test("journals actual tool intervals only at final flush without executing a sec
 test("final effect journal preserves authoritative no-effect proof and marks unobserved errors unknown", async () => {
   const { session, events } = fixture();
   const tool = { name: "write", description: "", inputSchema: { type: "object" }, recoveryCategory: "side-effecting" as const, execute: vi.fn() };
-  await withOneShotFastMode(() => runAdmittedToolCall({ session, turnId: "turn", callId: "refused", tool, args: {},
+  await withOneShotFastMode("one-shot", () => runAdmittedToolCall({ session, turnId: "turn", callId: "refused", tool, args: {},
     invoke: async context => { context.crossEffectBoundary(); return { content: "invalid", isError: true,
       effectDisposition: confirmedNoEffectDisposition("fixture:refused", "input refused") }; } }));
-  await expect(withOneShotFastMode(() => runAdmittedToolCall({ session, turnId: "turn", callId: "unknown", tool, args: {},
+  await expect(withOneShotFastMode("one-shot", () => runAdmittedToolCall({ session, turnId: "turn", callId: "unknown", tool, args: {},
     invoke: async context => { context.crossEffectBoundary(); throw new Error("unknown"); } }))).rejects.toThrow("unknown");
   flushOneShotEffectJournal(session);
   expect(events[1]?.msg).toMatchObject({ type: "effect_result", payload: { outcome: "failed", effectBoundary: "crossed",
