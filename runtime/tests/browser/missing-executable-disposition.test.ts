@@ -90,6 +90,36 @@ describe("Browser tool when no browser executable can be resolved", () => {
     expect(result.effectDisposition?.disposition).not.toBe("confirmed_no_effect");
   });
 
+  it("settles a proxy listen failure as no effect before any browser launches", async () => {
+    seam.starts.mockRejectedValueOnce(Object.assign(new Error("listen EACCES 127.0.0.1"), { code: "EACCES" }));
+
+    const result = await navigateWith(managerFor(process.execPath));
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("listen EACCES");
+    expect(seam.launches).not.toHaveBeenCalled();
+    expect(seam.stops).toHaveBeenCalled();
+    expect(result.effectDisposition).toMatchObject({
+      disposition: "confirmed_no_effect",
+      evidenceKind: "boundary_not_crossed",
+      evidenceRef: "tool:Browser:proxy-listen-failed",
+    });
+  });
+
+  it("settles a missing sandbox boundary as no effect", async () => {
+    const tool = createBrowserTool({ manager: managerFor(process.execPath) });
+
+    const result = await tool.execute({ action: "navigate", url: "http://127.0.0.1:9/" });
+
+    expect(result.isError).toBe(true);
+    expect(result.effectDisposition).toMatchObject({
+      disposition: "confirmed_no_effect",
+      evidenceKind: "boundary_not_crossed",
+      evidenceRef: "tool:Browser:sandbox-boundary-missing",
+    });
+    expect(seam.starts).not.toHaveBeenCalled();
+  });
+
   it("does not trust an unbranded error that only looks like a missing executable", async () => {
     const forged = new Error("configured browser executable not found: forged");
     forged.name = "BrowserExecutableError";

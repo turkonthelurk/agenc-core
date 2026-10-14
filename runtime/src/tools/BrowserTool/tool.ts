@@ -305,7 +305,10 @@ export function createBrowserTool(
     const requiredError = validateRequired(action, input);
     if (requiredError !== undefined) return refuse(requiredError);
     if (sandboxExecutionBroker === undefined) {
-      throw missingSandboxExecutionBoundary("browser");
+      return validationErrorToolResult(
+        "tool:Browser:sandbox-boundary-missing",
+        missingSandboxExecutionBoundary("browser").message,
+      );
     }
     const mgr = await ensureManager(sandboxExecutionBroker);
 
