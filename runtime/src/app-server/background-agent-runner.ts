@@ -3368,6 +3368,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       : liveBoundSession(active.control, targetSessionId);
     const reviewCwd = boundChild?.sessionConfiguration?.cwd ?? parentCwd;
     const journalStore = boundChild?.rolloutStore ?? active.bootstrap.rolloutStore;
+    const reviewWriter = boundChild ?? session;
     return runWithCurrentRuntimeSession(session, () => {
       const driver = openStateDatabases({ cwd: reviewCwd, agencHome });
       try {
@@ -3376,7 +3377,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           outcome = resolveLiveDurableEffectReview(driver, reviewParams, {
             readAll: () => journalStore.readAll(),
             append: (eventId, payload) =>
-              session.emit(
+              reviewWriter.emit(
                 {
                   eventId,
                   id: eventId,

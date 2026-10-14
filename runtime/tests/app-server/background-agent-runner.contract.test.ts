@@ -2739,6 +2739,7 @@ describe("AgenC delegate background-agent runner", () => {
           effects.resolveEffectReview({ ...event.msg.payload, eventId: event.eventId! });
         },
       },
+      emit: (event: Event) => ({ ...event, seq: 3 }),
     } as unknown as Session;
     const live = {
       agentId: childId,
