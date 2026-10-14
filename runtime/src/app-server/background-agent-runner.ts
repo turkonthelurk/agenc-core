@@ -28,6 +28,7 @@ import {
 } from "../bin/bootstrap.js";
 import { ensureAgentControl } from "../bin/delegate-tool.js";
 import { AgentControl } from "../agents/control.js";
+import { liveAgentSession } from "../agents/live-session.js";
 import { clearSession } from "../commands/clear.js";
 import { runTurn } from "../session/run-turn.js";
 import { isToolCallPhysicallyExecuting } from "../session/executing-tool-calls.js";
@@ -119,6 +120,7 @@ import {
   type ResolveDurableEffectReviewOptions,
   type ResolveDurableEffectReviewResult,
 } from "../state/effect-review.js";
+import { StateRunDurabilityRepository } from "../state/run-durability.js";
 import { openStateDatabases } from "../state/sqlite-driver.js";
 import { mergeDaemonClientEnvironment } from "./client-env-snapshot.js";
 import {
@@ -3347,13 +3349,32 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     if (agencHome === undefined) {
       throw new Error("Live effect review requires the owning session's configuration home");
     }
+    const parentCwd = active.bootstrap.workspaceRoot;
+    const targetSessionId = params.sessionId === ownerSessionId
+      ? childSessionForUnresolvedCall({
+          control: active.control,
+          rolloutStore: active.bootstrap.rolloutStore,
+          ownerSessionId,
+          toolCallId: params.toolCallId,
+          parentCwd,
+          agencHome,
+        }) ?? ownerSessionId
+      : params.sessionId;
+    const reviewParams = targetSessionId === params.sessionId
+      ? params
+      : { ...params, sessionId: targetSessionId };
+    const boundChild = targetSessionId === ownerSessionId
+      ? undefined
+      : liveBoundSession(active.control, targetSessionId);
+    const reviewCwd = boundChild?.sessionConfiguration?.cwd ?? parentCwd;
+    const journalStore = boundChild?.rolloutStore ?? active.bootstrap.rolloutStore;
     return runWithCurrentRuntimeSession(session, () => {
-      const driver = openStateDatabases({ cwd: active.bootstrap.workspaceRoot, agencHome });
+      const driver = openStateDatabases({ cwd: reviewCwd, agencHome });
       try {
         let outcome: ResolveDurableEffectReviewResult;
         try {
-          outcome = resolveLiveDurableEffectReview(driver, params, {
-            readAll: () => active.bootstrap.rolloutStore.readAll(),
+          outcome = resolveLiveDurableEffectReview(driver, reviewParams, {
+            readAll: () => journalStore.readAll(),
             append: (eventId, payload) =>
               session.emit(
                 {
@@ -3364,7 +3385,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
                 { durable: true },
               ),
             project: (event) =>
-              active.bootstrap.rolloutStore.recordEffectEvent(event),
+              journalStore.recordEffectEvent(event),
           });
         } catch (error) {
           const childJournal = ownerSessionId !== params.sessionId &&
@@ -3385,11 +3406,15 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           outcome.durable &&
           params.resolution.workflowStatus !== "pending"
         ) {
-          resolveLiveEffectPoison(session, {
-            callId: params.toolCallId,
+          const poison = {
+            callId: reviewParams.toolCallId,
             ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
             ...(outcome.stepId !== undefined ? { stepId: outcome.stepId } : {}),
-          });
+          };
+          resolveLiveEffectPoison(session, poison);
+          if (boundChild !== undefined && boundChild !== session) {
+            resolveLiveEffectPoison(boundChild, poison);
+          }
         }
         if (active.deferredDurableResumePendingReview &&
           outcome.kind !== "not_found" &&
@@ -6042,6 +6067,81 @@ function installDaemonTurnDriverHooks(
 
 export const __installDaemonTurnDriverHooksForTest =
   installDaemonTurnDriverHooks;
+
+function descendantSessionIds(
+  control: AgentControl,
+  rolloutStore: object,
+  ownerSessionId: string,
+): readonly string[] {
+  const ids = new Set<string>();
+  const list = (rolloutStore as {
+    listThreadSpawnDescendants?: (
+      rootThreadId: string,
+    ) => readonly { readonly childThreadId: string }[];
+  }).listThreadSpawnDescendants;
+  if (list !== undefined) {
+    for (const edge of list.call(rolloutStore, ownerSessionId)) {
+      ids.add(String(edge.childThreadId));
+    }
+  }
+  const listLive = (control as { listLive?: AgentControl["listLive"] }).listLive;
+  if (listLive !== undefined) {
+    for (const agent of listLive.call(control)) {
+      const id = String(agent.agentId);
+      if (id !== ownerSessionId) ids.add(id);
+    }
+  }
+  return [...ids];
+}
+
+function liveBoundSession(control: AgentControl, sessionId: string): Session | undefined {
+  const getLive = (control as { getLive?: AgentControl["getLive"] }).getLive;
+  if (getLive === undefined) return undefined;
+  const live = getLive.call(control, sessionId as never);
+  if (live === undefined) return undefined;
+  return liveAgentSession(live);
+}
+
+function effectRecorded(
+  cwd: string,
+  agencHome: string,
+  sessionId: string,
+  toolCallId: string,
+): boolean {
+  const driver = openStateDatabases({ cwd, agencHome });
+  try {
+    return new StateRunDurabilityRepository(driver).getEffectBySessionCall(
+      sessionId,
+      toolCallId,
+    ) !== undefined;
+  } finally {
+    driver.close();
+  }
+}
+
+function childSessionForUnresolvedCall(args: {
+  readonly control: AgentControl;
+  readonly rolloutStore: object;
+  readonly ownerSessionId: string;
+  readonly toolCallId: string;
+  readonly parentCwd: string;
+  readonly agencHome: string;
+}): string | undefined {
+  if (effectRecorded(args.parentCwd, args.agencHome, args.ownerSessionId, args.toolCallId)) {
+    return undefined;
+  }
+  const matches: string[] = [];
+  for (const id of descendantSessionIds(args.control, args.rolloutStore, args.ownerSessionId)) {
+    const cwd = liveBoundSession(args.control, id)?.sessionConfiguration?.cwd ?? args.parentCwd;
+    if (effectRecorded(cwd, args.agencHome, id, args.toolCallId)) matches.push(id);
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      `tool call ${args.toolCallId} is unresolved in more than one spawned session: ${matches.join(", ")}. Run /resolve in one of those sessions.`,
+    );
+  }
+  return matches[0];
+}
 
 function spawnedEffectSession(
   rolloutStore: object,

@@ -101,6 +101,9 @@ import { createOperatorEffectReviewResolution } from "../../src/state/effect-rev
 import { listUnresolvedUnknownOutcomeEffects } from "../../src/state/unknown-outcome-gate.js";
 import { recordInFlightToolCallUnknownOutcome } from "../../src/state/tool-output-rotation.js";
 import { seedPendingEffectReview } from "../state/helpers/effect-review-fixture.js";
+import { bindLiveAgentSession } from "../../src/agents/live-session.js";
+import { assertNoLiveUnknownEffect, poisonLiveEffect } from "../../src/budget/effect-settlement-supervisor.js";
+import type { LiveAgent } from "../../src/agents/control.js";
 import { registerChildApprovalSession, revokeChildApprovalSession } from "../../src/agents/child-approval-context.js";
 import type { ApprovalResolver } from "../../src/permissions/guardian/arbiter.js";
 import type { TurnContext } from "../session/turn-context.js";
@@ -2697,6 +2700,84 @@ describe("AgenC delegate background-agent runner", () => {
       clearCurrentRuntimeSession();
       await target.runner.stopAgent(parentId);
       driver.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a live worktree child's effect from the parent and clears the child's gate", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "agenc-live-review-worktree-"));
+    const cwd = join(root, "workspace");
+    const childCwd = join(root, "worktree");
+    const home = join(root, "owner");
+    mkdirSync(cwd);
+    mkdirSync(childCwd);
+    const parentId = "parent-agent";
+    const childId = "worktree-child";
+    const recordedAt = "2026-09-18T00:00:00.000Z";
+    const childItems: unknown[] = [{ type: "event_msg", timestamp: recordedAt, payload: {
+      eventId: "unknown-1", id: "unknown-1", seq: 2, msg: { type: "effect_unknown_outcome", payload: {
+        runId: childId, stepId: "tool:step-1", callId: "call-1", toolName: "Browser",
+        recoveryCategory: "side-effecting", reason: "tool_error_result_without_authoritative_effect_disposition",
+        requiresReview: true, recordedAt,
+      } },
+    } }];
+    const target = makeTopLevelRunner({ conversationId: parentId, workspaceRoot: cwd });
+    Object.assign(target.configStore, { homeContext: { path: home } });
+    const childDriver = openStateDatabases({ cwd: childCwd, agencHome: home });
+    const parentDriver = openStateDatabases({ cwd, agencHome: home });
+    const effects = new StateRunDurabilityRepository(childDriver);
+    const childSession = {
+      conversationId: childId,
+      abortController: new AbortController(),
+      isShuttingDown: false,
+      onBeforeDurableClose: () => () => {},
+      sessionConfiguration: { cwd: childCwd },
+      rolloutStore: {
+        readAll: () => childItems,
+        recordEffectEvent: (event: Event) => {
+          if (event.msg.type !== "effect_review_resolved") throw new Error("unexpected review event");
+          effects.resolveEffectReview({ ...event.msg.payload, eventId: event.eventId! });
+        },
+      },
+    } as unknown as Session;
+    const live = {
+      agentId: childId,
+      agentPath: "/root/worktree_child",
+      abortController: new AbortController(),
+    } as unknown as LiveAgent;
+    bindLiveAgentSession(live, childSession);
+    poisonLiveEffect(childSession, {
+      runId: childId, stepId: "tool:step-1", callId: "call-1", toolName: "Browser",
+      recoveryCategory: "side-effecting",
+    });
+    Object.assign(target.control, {
+      getLive: (id: string) => id === childId ? live : undefined,
+      listLive: () => [live],
+    });
+    Object.assign(target.rolloutStore, {
+      listThreadSpawnDescendants: () => [{ childThreadId: childId }],
+      readAll: () => [],
+    });
+    const resolution = createOperatorEffectReviewResolution({
+      disposition: "confirmed_no_effect", actorId: "operator", evidenceRef: "test:worktree-child",
+      evidenceSha256: "c".repeat(64), reviewedAt: recordedAt,
+    });
+    clearCurrentRuntimeSession();
+    try {
+      seedPendingEffectReview(childDriver, childId, recordedAt);
+      expect(() => assertNoLiveUnknownEffect(childSession, "side-effecting")).toThrow(/unresolved/);
+      await target.runner.startAgent({ objective: "idle worktree parent", deferInitialTurn: true });
+      await expect(target.runner.resolveLiveEffectReview(parentId, {
+        sessionId: parentId, toolCallId: "call-1", resolution,
+      })).resolves.toMatchObject({ kind: "resolved", durable: true, runId: childId });
+      expect(() => assertNoLiveUnknownEffect(childSession, "side-effecting")).not.toThrow();
+      expect(listUnresolvedUnknownOutcomeEffects(childDriver, childId)).toHaveLength(0);
+      expect(listUnresolvedUnknownOutcomeEffects(parentDriver, childId)).toHaveLength(0);
+    } finally {
+      clearCurrentRuntimeSession();
+      await target.runner.stopAgent(parentId);
+      childDriver.close();
+      parentDriver.close();
       rmSync(root, { recursive: true, force: true });
     }
   });
