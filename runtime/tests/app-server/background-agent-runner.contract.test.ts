@@ -2637,12 +2637,66 @@ describe("AgenC delegate background-agent runner", () => {
       expect(new StateRunDurabilityRepository(otherDriver).getEffect(sessionId, "tool:step-1")?.reviewStatus).toBe("pending");
       expect(target.rolloutItems.filter((item) => (item as { payload?: { msg?: { type?: string } } }).payload?.msg?.type === "effect_review_resolved")).toHaveLength(1);
       await expect(target.runner.resolveLiveEffectReview(sessionId, { ...params, sessionId: "wrong-owner" })).rejects.toThrow("does not own session");
+      await expect(target.runner.resolveLiveEffectReview(sessionId, { ...params, sessionId: "wrong-owner" })).rejects.toThrow("Run /resolve in session wrong-owner");
     } finally {
       clearCurrentRuntimeSession();
       await target.runner.stopAgent(sessionId);
       await other.runner.stopAgent(sessionId);
       driver.close();
       otherDriver.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("lets a parent settle an effect recorded for a session it spawned", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "agenc-live-review-child-"));
+    const cwd = join(root, "workspace");
+    const home = join(root, "owner");
+    mkdirSync(cwd);
+    const parentId = "parent-agent";
+    const childId = "child-session";
+    const recordedAt = "2026-09-18T00:00:00.000Z";
+    const target = makeTopLevelRunner({ conversationId: parentId, workspaceRoot: cwd,
+      rolloutItems: [{ type: "event_msg", timestamp: recordedAt, payload: {
+        eventId: "unknown-1", id: "unknown-1", seq: 2, msg: { type: "effect_unknown_outcome", payload: {
+          runId: childId, stepId: "tool:step-1", callId: "call-1", toolName: "Browser",
+          recoveryCategory: "side-effecting", reason: "tool_error_result_without_authoritative_effect_disposition",
+          requiresReview: true, recordedAt,
+        } },
+      } }],
+    });
+    Object.assign(target.configStore, { homeContext: { path: home } });
+    const driver = openStateDatabases({ cwd, agencHome: home });
+    const effects = new StateRunDurabilityRepository(driver);
+    Object.assign(target.rolloutStore, {
+      listThreadSpawnDescendants: (rootThreadId: string) =>
+        rootThreadId === parentId ? [{ childThreadId: childId }] : [],
+      recordEffectEvent: (event: Event) => {
+        if (event.msg.type !== "effect_review_resolved") throw new Error("unexpected review event");
+        effects.resolveEffectReview({ ...event.msg.payload, eventId: event.eventId! });
+      },
+    });
+    const resolution = createOperatorEffectReviewResolution({
+      disposition: "confirmed_no_effect", actorId: "operator", evidenceRef: "test:child-no-effect",
+      evidenceSha256: "b".repeat(64), reviewedAt: recordedAt,
+    });
+    clearCurrentRuntimeSession();
+    try {
+      seedPendingEffectReview(driver, childId, recordedAt);
+      recordInFlightToolCallUnknownOutcome(driver, { sessionId: childId, agentId: childId,
+        toolCallId: "call-1", toolName: "Browser", observedAt: recordedAt, recoveryCategory: "side-effecting" });
+      await target.runner.startAgent({ objective: "idle parent review", deferInitialTurn: true });
+      await expect(target.runner.resolveLiveEffectReview(parentId, {
+        sessionId: "stranger", toolCallId: "call-1", resolution,
+      })).rejects.toThrow("Run /resolve in session stranger");
+      await expect(target.runner.resolveLiveEffectReview(parentId, {
+        sessionId: childId, toolCallId: "call-1", resolution,
+      })).resolves.toMatchObject({ kind: "resolved", durable: true, runId: childId });
+      expect(listUnresolvedUnknownOutcomeEffects(driver, childId)).toHaveLength(0);
+    } finally {
+      clearCurrentRuntimeSession();
+      await target.runner.stopAgent(parentId);
+      driver.close();
       rmSync(root, { recursive: true, force: true });
     }
   });

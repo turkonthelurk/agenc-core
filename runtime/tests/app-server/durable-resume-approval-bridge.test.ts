@@ -1078,7 +1078,7 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
           evidenceRef: "test:worker", evidenceSha256: "a".repeat(64),
           reviewedAt: new Date().toISOString(),
         }),
-      })).rejects.toThrow(/does not own session/);
+      })).resolves.toEqual({ kind: "not_found" });
       await expect(runner.submitAgentMessage(CONVERSATION_ID, {
         sessionId: CONVERSATION_ID, content: "New turn", originalContent: "New turn",
         messageId: "new-turn", streamId: "new-turn", acceptedAt: new Date().toISOString(),

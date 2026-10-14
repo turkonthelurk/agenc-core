@@ -114,6 +114,7 @@ import {
   resolveLiveEffectPoison,
 } from "../budget/effect-settlement-supervisor.js";
 import {
+  resolveDurableEffectReview,
   resolveLiveDurableEffectReview,
   type ResolveDurableEffectReviewOptions,
   type ResolveDurableEffectReviewResult,
@@ -3335,9 +3336,10 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     if (active === undefined || !isRunnableActiveAgent(active)) {
       throw new Error(`AgenC daemon agent not running: ${agentId}`);
     }
-    if (active.bootstrap.session.conversationId !== params.sessionId) {
+    const ownerSessionId = String(active.bootstrap.session.conversationId);
+    if (ownerSessionId !== params.sessionId && !spawnedEffectSession(active.bootstrap.rolloutStore, ownerSessionId, params.sessionId)) {
       throw new Error(
-        `AgenC daemon agent ${agentId} does not own session ${params.sessionId}`,
+        `AgenC daemon agent ${agentId} does not own session ${params.sessionId}. Run /resolve in session ${params.sessionId}.`,
       );
     }
     const session = active.bootstrap.session;
@@ -3348,20 +3350,36 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     return runWithCurrentRuntimeSession(session, () => {
       const driver = openStateDatabases({ cwd: active.bootstrap.workspaceRoot, agencHome });
       try {
-        const outcome = resolveLiveDurableEffectReview(driver, params, {
-          readAll: () => active.bootstrap.rolloutStore.readAll(),
-          append: (eventId, payload) =>
-            session.emit(
-              {
-                eventId,
-                id: eventId,
-                msg: { type: "effect_review_resolved", payload },
-              },
-              { durable: true },
-            ),
-          project: (event) =>
-            active.bootstrap.rolloutStore.recordEffectEvent(event),
-        });
+        let outcome: ResolveDurableEffectReviewResult;
+        try {
+          outcome = resolveLiveDurableEffectReview(driver, params, {
+            readAll: () => active.bootstrap.rolloutStore.readAll(),
+            append: (eventId, payload) =>
+              session.emit(
+                {
+                  eventId,
+                  id: eventId,
+                  msg: { type: "effect_review_resolved", payload },
+                },
+                { durable: true },
+              ),
+            project: (event) =>
+              active.bootstrap.rolloutStore.recordEffectEvent(event),
+          });
+        } catch (error) {
+          const childJournal = ownerSessionId !== params.sessionId &&
+            error instanceof Error &&
+            error.message.includes("matching unknown-outcome records");
+          if (!childJournal) throw error;
+          try {
+            outcome = resolveDurableEffectReview(driver, params);
+          } catch (durableError) {
+            const detail = durableError instanceof Error ? durableError.message : String(durableError);
+            throw new Error(
+              `AgenC daemon agent ${agentId} could not review session ${params.sessionId}. Run /resolve in session ${params.sessionId}. ${detail}`,
+            );
+          }
+        }
         if (
           outcome.kind !== "not_found" &&
           outcome.durable &&
@@ -6024,3 +6042,18 @@ function installDaemonTurnDriverHooks(
 
 export const __installDaemonTurnDriverHooksForTest =
   installDaemonTurnDriverHooks;
+
+function spawnedEffectSession(
+  rolloutStore: object,
+  ownerSessionId: string,
+  requestedSessionId: string,
+): boolean {
+  const list = (rolloutStore as {
+    listThreadSpawnDescendants?: (
+      rootThreadId: string,
+    ) => readonly { readonly childThreadId: string }[];
+  }).listThreadSpawnDescendants;
+  if (list === undefined) return false;
+  return list.call(rolloutStore, ownerSessionId).some((edge) =>
+    String(edge.childThreadId) === requestedSessionId);
+}
